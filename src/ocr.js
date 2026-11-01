@@ -40,12 +40,31 @@ async function variant(buf, kind) {
   return img.jpeg({ quality: 92 }).toBuffer();
 }
 
+
 async function read(buf) {
   const file = path.join(os.tmpdir(), `ocr-${randomUUID()}.jpg`);
-  await fs.writeFile(file, buf);
-  try { return (await (await engine()).detect(file)).texts.filter((t) => t.text?.trim()); }
-  finally { fs.rm(file, { force: true }).catch(() => {}); }
+
+  try {
+    console.log('[OCR] Writing image:', file);
+    await fs.writeFile(file, buf);
+
+    console.log('[OCR] Initializing PaddleOCR engine...');
+    const ocr = await engine();
+
+    console.log('[OCR] Engine initialized. Running detection...');
+    const result = await ocr.detect(file);
+
+    console.log('[OCR] Detection completed.');
+    return result.texts.filter((t) => t.text?.trim());
+  } catch (error) {
+    console.error('[OCR] FULL ERROR:', error);
+    console.error('[OCR] STACK:', error?.stack);
+    throw error;
+  } finally {
+    await fs.rm(file, { force: true }).catch(() => {});
+  }
 }
+
 
 function parse(lines, known) {
   const fields = []; const unlabeled = [];
