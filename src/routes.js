@@ -8,12 +8,14 @@ import { z } from 'zod';
 import { Record, normKey } from './models.js';
 import { requireAdmin } from './auth.js';
 import { emit } from './realtime.js';
-import { extract } from './ocr.js';
+
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './uploads';
 await fs.mkdir(UPLOAD_DIR, { recursive: true });
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12 * 1024 * 1024 },
-  fileFilter: (_r, f, cb) => cb(null, /^image\//.test(f.mimetype)) });
+const upload = multer({
+  storage: multer.memoryStorage(), limits: { fileSize: 12 * 1024 * 1024 },
+  imageId: z.string().regex(/^[\w-]+\.jpg$/).optional(),
+});
 export const api = Router();
 
 let labelCache = { at: 0, v: [] };
@@ -25,19 +27,48 @@ async function knownLabels() {  // labels users already use (most frequent first
   return labelCache.v;
 }
 
+
 // ---- scan: image -> fields (nothing saved until the user confirms) ----
 api.post('/scan/preview', upload.single('image'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'Attach an image file.' });
+  if (!req.file) {
+    return res.status(400).json({ error: 'Attach an image file.' });
+  }
+
   const precise = req.query.precise === '1';
   let data;
-  try { data = await extract(req.file.buffer, { precise, knownKeys: await knownLabels() }); }
-  catch (e) { console.error('ocr failed:', e); return res.status(422).json({ error: 'Scanner could not read this image. Try a sharper photo.' }); }
+
+  try {
+    console.log('[OCR] Loading OCR module...');
+
+    const { extract } = await import('./ocr.js');
+
+    console.log('[OCR] OCR module loaded successfully');
+    console.log('[OCR] Starting extraction...');
+
+    data = await extract(req.file.buffer, {
+      precise,
+      knownKeys: await knownLabels()
+    });
+
+    console.log('[OCR] Extraction completed');
+
+  } catch (e) {
+    console.error('[OCR] FULL ERROR:', e);
+    console.error('[OCR] STACK:', e?.stack);
+
+    return res.status(422).json({
+      error: 'Scanner could not read this image. Try a sharper photo.'
+    });
+  }
+
   if (precise) {
     data.imageId = `${randomUUID()}.jpg`;
     await fs.writeFile(path.join(UPLOAD_DIR, data.imageId), req.file.buffer);
   }
+
   res.json(data);
 });
+
 
 // ---- records ----
 const fieldZ = z.object({ key: z.string().trim().min(1).max(80), value: z.string().trim().max(500), confidence: z.number().min(0).max(1).optional() });
@@ -85,7 +116,7 @@ api.patch('/records/:id', async (req, res) => {
 api.delete('/records/:id', requireAdmin, async (req, res) => {
   const doc = await Record.findByIdAndDelete(req.params.id);
   if (!doc) return res.status(404).json({ error: 'Record not found.' });
-  if (doc.image) fs.rm(path.join(UPLOAD_DIR, doc.image), { force: true }).catch(() => {});
+  if (doc.image) fs.rm(path.join(UPLOAD_DIR, doc.image), { force: true }).catch(() => { });
   emit('record:deleted', { _id: req.params.id });
   res.status(204).end();
 });
@@ -99,14 +130,14 @@ api.get('/records/:id/image', async (req, res) => {
 api.get('/export.xlsx', async (req, res) => {
   const match = filter(req.query);
   const cols = await Record.aggregate([{ $match: match }, { $unwind: '$fields' },
-    { $group: { _id: '$fields.norm', label: { $first: '$fields.key' }, n: { $sum: 1 } } }, { $sort: { n: -1, _id: 1 } }]);
+  { $group: { _id: '$fields.norm', label: { $first: '$fields.key' }, n: { $sum: 1 } } }, { $sort: { n: -1, _id: 1 } }]);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="coildesk-${new Date().toISOString().slice(0, 10)}.xlsx"`);
   const wb = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res, useStyles: true });
   const ws = wb.addWorksheet('Records', { views: [{ state: 'frozen', ySplit: 1, xSplit: 2 }] });
   ws.columns = [{ header: 'Date', key: '_d', width: 18 }, { header: 'Vendor', key: '_v', width: 24 },
-    ...cols.map((c) => ({ header: c.label, key: c._id, width: Math.max(14, Math.min(34, c.label.length + 6)) })),
-    { header: 'Entered by', key: '_u', width: 16 }, { header: 'Source', key: '_s', width: 10 }];
+  ...cols.map((c) => ({ header: c.label, key: c._id, width: Math.max(14, Math.min(34, c.label.length + 6)) })),
+  { header: 'Entered by', key: '_u', width: 16 }, { header: 'Source', key: '_s', width: 10 }];
   const head = ws.getRow(1);
   head.font = { bold: true, color: { argb: 'FFFFFFFF' } };
   head.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1D4E89' } };
