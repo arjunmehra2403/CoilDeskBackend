@@ -1,6 +1,4 @@
-// In-process OCR (PaddleOCR PP-OCR models via ONNX) - no Python, no external API.
-// live  (precise=false): one pass            -> fast, drives the auto-scan loop
-// final (precise=true) : 2 image variants cross-checked, labels snapped to known ones, digit repair.
+
 import Ocr from '@gutenye/ocr-node';
 import sharp from 'sharp';
 import { closest, distance } from 'fastest-levenshtein';
@@ -9,129 +7,525 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
+// --------------------------------------------------
+// OCR CONFIGURATION
+// --------------------------------------------------
+
+sharp.cache(false);
+sharp.concurrency(1);
+
 let enginePromise;
-const engine = () => (enginePromise ??= Ocr.create());
 
-// small concurrency gate so many users cannot exhaust CPU/RAM
-const LIMIT = Number(process.env.OCR_CONCURRENCY || 2);
-let active = 0; const waiting = [];
+const engine = () => {
+  if (!enginePromise) {
+    enginePromise = Ocr.create().catch((error) => {
+      enginePromise = null;
+      throw error;
+    });
+  }
+
+  return enginePromise;
+};
+
+// Only one OCR job at a time for low-memory instances.
+const LIMIT = Math.max(
+  1,
+  Number.parseInt(process.env.OCR_CONCURRENCY || '1', 10) || 1
+);
+
+let active = 0;
+const waiting = [];
+
 async function gate(fn) {
-  if (active >= LIMIT) await new Promise((r) => waiting.push(r));
+  if (active >= LIMIT) {
+    await new Promise((resolve) => waiting.push(resolve));
+  }
+
   active++;
-  try { return await fn(); } finally { active--; waiting.shift()?.(); }
-}
-
-const PAIR = /([A-Za-z][A-Za-z0-9 .()\/&_-]{1,32}?)\s*[:;]\s*-?\s*(.*?)(?=\s+[A-Za-z][A-Za-z0-9 .()\/&_-]{1,32}?\s*[:;]|$)/g;
-const NUMERIC_KEY = /weight|wt|gsm|size|sheet|qty|quantity|\bnos?\b|date|batch|coil|heat|pkt|thick/i;
-const CONFUSE = { O: '0', o: '0', I: '1', l: '1', '|': '1', S: '5', B: '8', Z: '2' };
-export const norm = (k) => String(k).toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
-const clean = (v) => v.replace(/^[\s:;\-]+|\s+$/g, '');
-const titleIfUpper = (k) => (k === k.toUpperCase() ? k.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()) : k);
-
-const DEFAULT_KEYS = ['Customer Name', 'Customer', 'Batch No', 'Coil No', 'Mother Coil No', 'Heat No', 'Pkt No', 'Product', 'Grade',
-  'Size', 'Coating', 'No of Sheets', 'Net Weight', 'Gross Weight', 'Quality', 'Date', 'Inspected By', 'Vendor', 'Invoice No', 'Quantity'];
-const fuzzyPrefix = (key) => new RegExp('^' + [...key.replace(/[^A-Za-z0-9]/g, '')].map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[\\s.()\\-]*') + '[\\s:;.\\-]*(.+)$', 'i');
-
-async function variant(buf, kind) {
-  let img = sharp(buf, { failOn: 'none' }).rotate().grayscale();
-  if (kind === 'live') img = img.resize({ width: 1100 }).normalise();
-  else if (kind === 'a') img = img.resize({ width: 1600, withoutEnlargement: false }).clahe({ width: 32, height: 32, maxSlope: 3 });
-  else img = img.resize({ width: 2400 }).normalise().sharpen({ sigma: 1.4 });
-  return img.jpeg({ quality: 92 }).toBuffer();
-}
-
-
-async function read(buf) {
-  const file = path.join(os.tmpdir(), `ocr-${randomUUID()}.jpg`);
 
   try {
-    console.log('[OCR] Writing image:', file);
-    await fs.writeFile(file, buf);
+    return await fn();
+  } finally {
+    active--;
+    waiting.shift()?.();
+  }
+}
 
-    console.log('[OCR] Initializing PaddleOCR engine...');
+// Second detection pass is disabled by default.
+// Enable only after testing with sufficient RAM.
+const SECOND_PASS =
+  process.env.OCR_PRECISE_SECOND_PASS === 'true';
+
+// --------------------------------------------------
+// FIELD PARSING CONFIGURATION
+// --------------------------------------------------
+
+const PAIR =
+  /([A-Za-z][A-Za-z0-9 .()\/&_-]{1,32}?)\s*[:;]\s*(.*?)(?=\s+[A-Za-z][A-Za-z0-9 .()\/&_-]{1,32}?\s*[:;]|$)/g;
+
+const NUMERIC_KEY =
+  /weight|wt|gsm|size|sheet|qty|quantity|\bnos?\b|date|batch|coil|heat|pkt|thick/i;
+
+const CONFUSE = {
+  O: '0',
+  o: '0',
+  I: '1',
+  l: '1',
+  '|': '1',
+  S: '5',
+  B: '8',
+  Z: '2'
+};
+
+export const norm = (value) =>
+  String(value)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .trim();
+
+const clean = (value) =>
+  String(value)
+    .replace(/^[\s:;*\\-]+|[\s*]+$/g, '')
+    .trim();
+
+const titleIfUpper = (key) =>
+  key === key.toUpperCase()
+    ? key.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase())
+    : key;
+
+const DEFAULT_KEYS = [
+  'Customer Name',
+  'Customer',
+  'Batch No',
+  'Coil No',
+  'Mother Coil No',
+  'Heat No',
+  'Pkt No',
+  'Product',
+  'Grade',
+  'Size',
+  'Coating',
+  'No of Sheets',
+  'Net Weight',
+  'Gross Weight',
+  'Quality',
+  'Date',
+  'Inspected By',
+  'Vendor',
+  'Invoice No',
+  'Quantity'
+];
+
+const escapeRegex = (value) =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const fuzzyPrefix = (key) => {
+  const pattern = key
+    .trim()
+    .split(/\s+/)
+    .map(escapeRegex)
+    .join('[\\s.()\\-]*');
+
+  return new RegExp(
+    '^' + pattern + '[\\s:;.-]+(.+)$',
+    'i'
+  );
+};
+
+// --------------------------------------------------
+// MEMORY LOGGING
+// --------------------------------------------------
+
+function logMemory(label) {
+  const memory = process.memoryUsage();
+
+  console.log(`[MEMORY] ${label}`, {
+    rssMB: Math.round(memory.rss / 1024 / 1024),
+    heapUsedMB: Math.round(memory.heapUsed / 1024 / 1024),
+    externalMB: Math.round(memory.external / 1024 / 1024)
+  });
+}
+
+// --------------------------------------------------
+// IMAGE PREPROCESSING
+// --------------------------------------------------
+
+async function variant(buffer, kind) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+    throw new Error('Invalid or empty image buffer.');
+  }
+
+  // Resize to reduce image processing memory.
+  // Do not enlarge small images.
+  let image = sharp(buffer, {
+    failOn: 'none',
+    limitInputPixels: 30000000
+  })
+    .rotate()
+    .grayscale();
+
+  if (kind === 'live') {
+    image = image
+      .resize({
+        width: 900,
+        withoutEnlargement: true
+      })
+      .normalise();
+  } else {
+    image = image
+      .resize({
+        width: 1200,
+        withoutEnlargement: true
+      })
+      .normalise();
+  }
+
+  return image
+    .jpeg({ quality: 85 })
+    .toBuffer();
+}
+
+// --------------------------------------------------
+// OCR DETECTION
+// --------------------------------------------------
+
+async function read(buffer) {
+  const file = path.join(
+    os.tmpdir(),
+    `ocr-${randomUUID()}.jpg`
+  );
+
+  try {
+    logMemory('Before image write');
+
+    await fs.writeFile(file, buffer);
+
+    console.log('[OCR] Initializing OCR engine...');
+
     const ocr = await engine();
 
-    console.log('[OCR] Engine initialized. Running detection...');
+    console.log('[OCR] OCR engine ready.');
+
+    logMemory('Before detection');
+
+    console.log('[OCR] Running image detection...');
+
     const result = await ocr.detect(file);
 
     console.log('[OCR] Detection completed.');
-    return result.texts.filter((t) => t.text?.trim());
+
+    logMemory('After detection');
+
+    if (!Array.isArray(result?.texts)) {
+      throw new Error('OCR returned an invalid result.');
+    }
+
+    return result.texts.filter(
+      (item) => item.text?.trim()
+    );
+
   } catch (error) {
-    console.error('[OCR] FULL ERROR:', error);
-    console.error('[OCR] STACK:', error?.stack);
+    console.error('[OCR] Detection failed:', error);
+    console.error('[OCR] Stack:', error?.stack);
+
     throw error;
+
   } finally {
-    await fs.rm(file, { force: true }).catch(() => {});
+    await fs.rm(file, { force: true }).catch(() => { });
   }
 }
 
+// --------------------------------------------------
+// TEXT PARSING
+// --------------------------------------------------
 
 function parse(lines, known) {
-  const fields = []; const unlabeled = [];
-  const prefixes = known.map((k) => [k, fuzzyPrefix(k)]);
-  for (const l of lines) {
-    const text = l.text.normalize('NFKC').trim(); const conf = l.mean ?? 0.5;
-    let pairs = [...text.matchAll(PAIR)].map((m) => [m[1].trim().replace(/^([^()]*\([^()]*)$/, '$1)'), clean(m[2])]).filter(([, v]) => v);
-    if (!pairs.length) {  // no colon on the label: match the line start against labels we already know
-      for (const [k, rx] of prefixes) { const m = text.match(rx); if (m && clean(m[1]).length >= 2) { pairs = [[k, clean(m[1])]]; break; } }
+  const fields = [];
+  const unlabeled = [];
+
+  const prefixes = known.map((key) => [
+    key,
+    fuzzyPrefix(key)
+  ]);
+
+  for (const line of lines) {
+    const text = line.text.normalize('NFKC').trim();
+    const confidence = line.mean ?? 0.5;
+
+    let pairs = [...text.matchAll(PAIR)]
+      .map((match) => [
+        match[1].trim(),
+        clean(match[2])
+      ])
+      .filter(([, value]) => value);
+
+    if (!pairs.length) {
+      for (const [key, regex] of prefixes) {
+        const match = text.match(regex);
+
+        if (match && clean(match[1]).length >= 2) {
+          pairs = [[key, clean(match[1])]];
+          break;
+        }
+      }
     }
-    if (pairs.length) for (const [k, v] of pairs) fields.push({ key: titleIfUpper(k), value: v, confidence: +conf.toFixed(3) });
-    else if (/\d/.test(text) && text.length <= 40) unlabeled.push({ text, conf });
+
+    if (pairs.length) {
+      for (const [key, value] of pairs) {
+        fields.push({
+          key: titleIfUpper(key),
+          value,
+          confidence: +confidence.toFixed(3)
+        });
+      }
+    } else if (/\d/.test(text) && text.length <= 40) {
+      unlabeled.push({
+        text,
+        conf: confidence
+      });
+    }
   }
+
   return { fields, unlabeled };
 }
 
-function repair(f, known) {
+// --------------------------------------------------
+// OCR VALUE REPAIR
+// --------------------------------------------------
+
+function repair(field, known) {
   if (known.length) {
-    const best = closest(norm(f.key), known.map(norm));
-    const i = known.map(norm).indexOf(best);
-    const d = distance(norm(f.key), best);
-    if (i >= 0 && d <= Math.max(1, Math.floor(best.length * 0.15))) f.key = known[i];
-  }
-  if (NUMERIC_KEY.test(f.key)) {
-    const alnum = f.value.replace(/[^A-Za-z0-9]/g, '');
-    const digits = (f.value.match(/\d/g) || []).length;
-    if (digits >= Math.max(2, alnum.length * 0.6) && !/[a-z]{3,}/.test(f.value)) {
-      const fixed = f.value.replace(/(?<=\d)[OolI|]|[OolI|](?=\d)/g, (c) => CONFUSE[c]).replace(/^[OolI|](?=[.,]\d)/, (c) => CONFUSE[c]);
-      if (fixed !== f.value) { f.value = fixed; f.confidence = +(f.confidence * 0.9).toFixed(3); }
+    const normalizedKnown = known.map(norm);
+    const best = closest(norm(field.key), normalizedKnown);
+
+    const index = normalizedKnown.indexOf(best);
+    const diff = distance(norm(field.key), best);
+
+    if (
+      index >= 0 &&
+      diff <= Math.max(1, Math.floor(best.length * 0.15))
+    ) {
+      field.key = known[index];
     }
   }
-  return f;
+
+  if (NUMERIC_KEY.test(field.key)) {
+    const alphanumeric = field.value.replace(
+      /[^A-Za-z0-9]/g,
+      ''
+    );
+
+    const digits = (field.value.match(/\d/g) || []).length;
+
+    if (
+      digits >= Math.max(2, alphanumeric.length * 0.6) &&
+      !/[a-z]{3,}/.test(field.value)
+    ) {
+      const fixed = field.value
+        .replace(
+          /(?<=\d)[OolI|]|[OolI|](?=\d)/g,
+          (character) => CONFUSE[character]
+        )
+        .replace(
+          /^[OolI|](?=[.,]\d)/,
+          (character) => CONFUSE[character]
+        );
+
+      if (fixed !== field.value) {
+        field.value = fixed;
+        field.confidence = +(
+          field.confidence * 0.9
+        ).toFixed(3);
+      }
+    }
+  }
+
+  return field;
 }
 
-function merge(passes) {  // agreement boosts confidence, disagreement lowers it so a human verifies
+// --------------------------------------------------
+// MULTI-PASS MERGING
+// --------------------------------------------------
+
+function merge(passes) {
   const best = new Map();
-  for (const fields of passes) for (const f of fields) {
-    const k = norm(f.key).replace(/ /g, ''); const cur = best.get(k);
-    if (!cur) { best.set(k, { ...f }); continue; }
-    const same = cur.value.replace(/\W/g, '').toLowerCase() === f.value.replace(/\W/g, '').toLowerCase();
-    if (same) cur.confidence = +Math.min(0.99, Math.max(cur.confidence, f.confidence) + 0.08).toFixed(3);
-    else { if (f.confidence > cur.confidence) { cur.value = f.value; cur.confidence = f.confidence; } cur.confidence = +(cur.confidence * 0.7).toFixed(3); }
+
+  for (const fields of passes) {
+    for (const field of fields) {
+      const key = norm(field.key).replace(/ /g, '');
+      const current = best.get(key);
+
+      if (!current) {
+        best.set(key, { ...field });
+        continue;
+      }
+
+      const same =
+        current.value.replace(/\W/g, '').toLowerCase() ===
+        field.value.replace(/\W/g, '').toLowerCase();
+
+      if (same) {
+        current.confidence = +Math.min(
+          0.99,
+          Math.max(current.confidence, field.confidence) + 0.08
+        ).toFixed(3);
+      } else {
+        if (field.confidence > current.confidence) {
+          current.value = field.value;
+          current.confidence = field.confidence;
+        }
+
+        current.confidence = +(
+          current.confidence * 0.7
+        ).toFixed(3);
+      }
+    }
   }
+
   return [...best.values()];
 }
 
-export function extract(buffer, { precise = false, knownKeys = [] } = {}) {
+// --------------------------------------------------
+// MAIN OCR FUNCTION
+// --------------------------------------------------
+
+export function extract(
+  buffer,
+  {
+    precise = false,
+    knownKeys = []
+  } = {}
+) {
   return gate(async () => {
-    const vocab = [...new Set([...knownKeys, ...DEFAULT_KEYS])];
-    const a = await read(await variant(buffer, precise ? 'a' : 'live'));
-    const pa = parse(a, vocab);
-    let fields = pa.fields; let unlabeled = pa.unlabeled; let engineName = 'paddleocr-fast';
-    if (precise) {
-      const pb = parse(await read(await variant(buffer, 'b')), vocab);
-      fields = merge([pa.fields, pb.fields]); engineName = 'paddleocr-crosscheck';
-      const f = (t) => t.replace(/\W/g, '').toLowerCase();
-      const near = (x, y) => distance(f(x), f(y)) <= Math.max(2, Math.floor(f(x).length * 0.3)) || f(x).includes(f(y)) || f(y).includes(f(x));
-      unlabeled = [...pa.unlabeled, ...pb.unlabeled.filter((u) => !pa.unlabeled.some((v) => near(u.text, v.text)))];
+    console.log('[OCR] Starting extraction...');
+
+    logMemory('Extraction started');
+
+    const vocab = [
+      ...new Set([
+        ...knownKeys,
+        ...DEFAULT_KEYS
+      ])
+    ];
+
+    // First pass
+    const firstImage = await variant(
+      buffer,
+      precise ? 'precise' : 'live'
+    );
+
+    const firstLines = await read(firstImage);
+
+    const firstParsed = parse(firstLines, vocab);
+
+    let fields = firstParsed.fields;
+    let unlabeled = firstParsed.unlabeled;
+
+    let engineName = precise
+      ? 'paddleocr-precise-single-pass'
+      : 'paddleocr-fast';
+
+    // Optional second pass.
+    // Disabled by default to reduce memory usage.
+    if (precise && SECOND_PASS) {
+      console.log('[OCR] Starting optional second pass...');
+
+      const secondImage = await variant(
+        buffer,
+        'precise'
+      );
+
+      const secondLines = await read(secondImage);
+
+      const secondParsed = parse(secondLines, vocab);
+
+      fields = merge([
+        firstParsed.fields,
+        secondParsed.fields
+      ]);
+
+      const normalizeText = (value) =>
+        value.replace(/\W/g, '').toLowerCase();
+
+      const near = (first, second) =>
+        distance(
+          normalizeText(first),
+          normalizeText(second)
+        ) <= Math.max(
+          2,
+          Math.floor(normalizeText(first).length * 0.3)
+        );
+
+      unlabeled = [
+        ...firstParsed.unlabeled,
+        ...secondParsed.unlabeled.filter(
+          (item) =>
+            !firstParsed.unlabeled.some(
+              (existing) => near(item.text, existing.text)
+            )
+        )
+      ];
+
+      engineName = 'paddleocr-crosscheck';
     }
-    fields = fields.map((f) => repair(f, vocab));
-    const flat = (t) => t.normalize('NFKC').replace(/\W/g, '').toLowerCase();
-    const have = fields.map((f) => flat(f.value)).filter((v) => v.length >= 4);
-    unlabeled = unlabeled.filter((u) => !have.some((v) => flat(u.text).includes(v)));
-    // values the engine could read but whose label it could not (blurry/small print): keep them, flagged amber
-    unlabeled.slice(0, 12).forEach((u, i) => fields.push({ key: `Unlabeled ${i + 1}`, value: u.text, confidence: Math.min(0.4, u.conf) }));
-    const labeled = fields.filter((f) => !f.key.startsWith('Unlabeled'));
-    const avg = labeled.length ? labeled.reduce((s, f) => s + f.confidence, 0) / labeled.length : 0;
-    return { fields, vendor: null, rawText: a.map((l) => l.text).join('\n'), engine: engineName, complete: labeled.length >= 4 && avg >= 0.55 };
+
+    fields = fields.map(
+      (field) => repair(field, vocab)
+    );
+
+    const flat = (value) =>
+      value
+        .normalize('NFKC')
+        .replace(/\W/g, '')
+        .toLowerCase();
+
+    const existingValues = fields
+      .map((field) => flat(field.value))
+      .filter((value) => value.length >= 4);
+
+    unlabeled = unlabeled.filter(
+      (item) =>
+        !existingValues.some(
+          (value) => flat(item.text).includes(value)
+        )
+    );
+
+    // Preserve readable values whose labels were not identified.
+    unlabeled.slice(0, 12).forEach((item, index) => {
+      fields.push({
+        key: `Unlabeled ${index + 1}`,
+        value: item.text,
+        confidence: Math.min(0.4, item.conf)
+      });
+    });
+
+    const labeled = fields.filter(
+      (field) => !field.key.startsWith('Unlabeled')
+    );
+
+    const averageConfidence = labeled.length
+      ? labeled.reduce(
+        (sum, field) => sum + field.confidence,
+        0
+      ) / labeled.length
+      : 0;
+
+    const response = {
+      fields,
+      vendor: null,
+      rawText: firstLines
+        .map((line) => line.text)
+        .join('\n'),
+      engine: engineName,
+      complete:
+        labeled.length >= 4 &&
+        averageConfidence >= 0.55
+    };
+
+    logMemory('Extraction completed');
+
+    console.log('[OCR] Extraction successful.');
+
+    return response;
   });
 }
